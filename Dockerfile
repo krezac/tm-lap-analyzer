@@ -11,5 +11,7 @@ RUN apk add --no-cache --virtual .build-deps \
     && pip install --no-cache-dir psycopg2 numpy \
     && apk del --no-cache .build-deps
 
+RUN apk add --no-cache libpq
+
 CMD [ "python", "./src/server.py" ]
 
