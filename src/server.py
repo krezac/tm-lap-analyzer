@@ -11,10 +11,11 @@ from collections import namedtuple
 from jinja2 import Template
 import urllib
 import pendulum
+import datetime
 
-csv_template = """id,start,end,time,dist,speed,odo_dist,d_soc,d_rng_ideal,d_rng_est,d_rng_rated,energy
+csv_template = """id,start,end,odo,time,dist,speed,soc,d_soc,rng_ideal,d_rng_ideal,rng_est,d_rng_est,rng_rated,d_rng_rated,energy_lap,energy_hour,energy_left,t_in,t_out
 {% for item in items -%}
-{{item.id}},{{item.start_time}},{{item.end_time}},{{item.lap_time}},{{'%.2f' % item.lap_dist}},{{'%.2f' % item.lap_speed}},{{'%.2f' % item.odo_dist}},{{'%.2f' % item.d_soc}},{{'%.2f' % item.d_rng_ideal}},{{'%.2f' % item.d_rng_est}},{{'%.2f' % item.d_rng_rated}},{{'%.2f' % item.d_energy}}
+{{item.id}},{{item.start_time}},{{item.end_time}},{{item.odo}},{{item.lap_time}},{{'%.2f' % item.lap_dist}},{{'%.2f' % item.lap_speed}},{{'%.2f' % item.soc}},{{'%.2f' % item.d_soc}},{{'%.2f' % item.rng_ideal}},{{'%.2f' % item.d_rng_ideal}},{{'%.2f' % item.rng_est}},{{'%.2f' % item.d_rng_est}},{{'%.2f' % item.rng_rated}}},{{'%.2f' % item.d_rng_rated}},{{'%.2f' % item.d_energy}},{{'%.2f' % item.energy_hour}},{{'%.2f' % item.energy_left}},{{'%.2f' % item.t_in}},{{'%.2f' % item.t_out}}
 {% endfor %}
 """
 
@@ -25,30 +26,34 @@ html_template = """
    <TH>id</th>
    <TH>start</th>
    <TH>end</th>
+   <TH>odo[km]</th>
+   <TH>soc[%]</th>
+   <TH>rng_rated[km]</th>
    <TH>time</th>
    <TH>dist[km]</th>
-   <TH>speed[km/h]</th>
-   <TH>odo_dist[km]</th>
-   <TH>d_soc[%]</th>
-   <TH>d_rng_ideal[km]</th>
-   <TH>d_rng_est[km]</th>
    <TH>d_rng_rated[km]</th>
-   <TH>energy[kW]</th>
+   <TH>speed[km/h]</th>
+   <TH>energy/lap[kW]</th>
+   <TH>energy/hour[kW]</th>
+   <TH>energy_left[kW]</th>
+   <TH>t_out[C]</th>
 </TR>
 {% for item in items %}
 <TR>
    <TD>{{item.id}}</TD>
    <TD>{{item.start_time}}</TD>
    <TD>{{item.end_time}}</TD>
+   <TD>{{'%.2f' % item.odo}}</TD>
+   <TD>{{'%.2f' % item.soc}}</TD>
+   <TD>{{'%.2f' % item.rng_rated}}</TD>
    <TD>{{item.lap_time}}</TD>
    <TD>{{'%.2f' % item.lap_dist}}</TD>
-   <TD>{{'%.2f' % item.lap_speed}}</TD>
-   <TD>{{'%.2f' % item.odo_dist}}</TD>
-   <TD>{{'%.2f' % item.d_soc}}</TD>
-   <TD>{{'%.2f' % item.d_rng_ideal}}</TD>
-   <TD>{{'%.2f' % item.d_rng_est}}</TD>
    <TD>{{'%.2f' % item.d_rng_rated}}</TD>
+   <TD>{{'%.2f' % item.lap_speed}}</TD>
    <TD>{{'%.2f' % item.d_energy}}</TD>
+   <TD>{{'%.2f' % item.energy_hour}}</TD>
+   <TD>{{'%.2f' % item.energy_left}}</TD>
+   <TD>{{'%.2f' % item.t_out}}</TD>
 </TR>
 {% endfor %}
 </table>
@@ -69,6 +74,9 @@ class testHTTPServer_RequestHandler(BaseHTTPRequestHandler):
             "consumption_rated": float(query['consumption_rated'][0]) if 'consumption_rated' in query else 14.7,
             "hours": int(query['hours'][0]) if 'hours' in query else 24,
             "format": query['format'][0] if 'format' in query else None,
+            "from_time": pendulum.parse(query['from_time'][0],tz='Europe/Prague') if 'from_time' in query else None,
+            "merge_from_lap": int(query['merge_from_lap'][0]) if 'merge_from_lap' in query else 1,
+            "lap_merge": int(query['lap_merge'][0]) if 'lap_merge' in query else 1,
         }
         # Send response status code
         self.send_response(200)
@@ -107,7 +115,10 @@ def do_db_stuff(config):
         print('Connecting to the PostgreSQL database...')
         conn = psycopg2.connect(host=hostname,database=db_name, user=login, password=password)
         cur = conn.cursor()
-        cur.execute("SELECT * FROM positions where date between (now() - '%s hour'::interval) and (now() - '%s hour'::interval) ORDER BY date", (config['hours'], 0))
+        if config["from_time"] is not None:
+            cur.execute("SELECT * FROM positions where date >= %s::timestamptz ORDER BY date", (datetime.datetime.fromtimestamp(config['from_time'].in_tz('utc').timestamp()),))
+        else:
+            cur.execute("SELECT * FROM positions where date between (now() - '%s hour'::interval) and (now() - '%s hour'::interval) ORDER BY date", (config['hours'], 0))
         print("The number of parts: ", cur.rowcount)
 
         rdef = namedtuple('dataset', ' '.join([x[0] for x in cur.description])) 
@@ -177,68 +188,107 @@ def find_laps(config, segment, region=10, min_time=5, start_idx=0):
     laps = []
     for i, idx in enumerate(enter_point):
         try:
-            laps.append((idx, enter_point[i+1]))
+            laps.append({"id": str(i+1), "from": idx, "to": enter_point[i+1]})
         except IndexError:
-            laps.append((idx, len(points)-1))
-    segment_laps = get_segment_laps(config, segment, laps)
+            laps.append({"id": str(i+1), "from": idx, "to": len(points)-1})
+    agg_laps = aggregate_laps(config, laps)
+    segment_laps = get_segment_laps(config, segment, agg_laps)
     return segment_laps
+
+def aggregate_laps(config, laps):
+    agg_start = config["merge_from_lap"]
+    agg_count = config["lap_merge"]
+
+    if agg_count <= 1 or len(laps) <= agg_start:
+        return laps
+
+    agg_laps = []
+
+    # copy the ones before start (1, 2, 3, ... agg_start - 1)
+    for i in range(agg_start - 1):
+        agg_laps.append(laps[i])
+
+    group_count = (len(laps) - agg_start + 1) // agg_count
+    for i in range(group_count):
+        first = laps[agg_start-1+i*agg_count]
+        last = laps[agg_start-1+(i+1)*agg_count - 1]
+        lap = {
+            "id": "" + first["id"] + "-" + last["id"],
+            "from": first["from"],
+            "to": last["to"],
+        }
+        agg_laps.append(lap)
+
+    for i in range(agg_start + agg_count*group_count - 1, len(laps)):
+        agg_laps.append(laps[i])
+    return agg_laps
+
+def extract_lap_info(config, lap_id, lap_data):
+    """ Lap data from database:
+    xx id |          
+    xx date           | 
+    xx latitude  | 
+    xx longitude | 
+    -- speed | 
+    -- power |  
+    xx odometer   | 
+    xx ideal_battery_range_km | 
+    xx battery_level | 
+    xx outside_temp | 
+    -- elevation | 
+    -- fan_status | 
+    -- driver_temp_setting | 
+    -- passenger_temp_set ting | 
+    -- is_climate_on | 
+    -- is_rear_defroster_on | 
+    -- is_front_defroster_on | 
+    -- car_id | 
+    -- drive_id | 
+    xx inside_temp | 
+    -- battery_heater |
+    -- battery_heater_on | 
+    -- battery_heater_no_power | 
+    xx est_battery_range_km | 
+    xx rated_battery_range_km
+    """
+    tz = pendulum.timezone('Europe/Paris')
+    sd = pendulum.instance(lap_data[0].date, 'utc')
+    ed = pendulum.instance(lap_data[-1].date, 'utc')
+    lap_time = lap_data[-1].date - lap_data[0].date
+    lap_dist = lap_data[-1].odometer -  lap_data[0].odometer
+    return {
+        "id": lap_id,
+        "start_time": sd.in_tz("Europe/Prague").format("DD.MM.YY HH:mm.ss"),
+        "end_time":  ed.in_tz("Europe/Prague").format("DD.MM.YY HH:mm.ss"),
+        "odo": lap_data[-1].odometer,
+        "t_in": lap_data[-1].inside_temp,
+        "t_out": lap_data[-1].outside_temp,
+        "lap_time": str(lap_time),
+        "lap_speed": lap_dist / lap_time.total_seconds() * 3600,
+        "lap_dist": lap_dist,
+        "soc": lap_data[-1].battery_level,
+        "d_soc": lap_data[0].battery_level -  lap_data[-1].battery_level,
+        "rng_ideal": lap_data[-1].ideal_battery_range_km,
+        "d_rng_ideal": lap_data[0].ideal_battery_range_km -  lap_data[-1].ideal_battery_range_km,
+        "rng_est": lap_data[-1].est_battery_range_km,
+        "d_rng_est": lap_data[0].est_battery_range_km -  lap_data[-1].est_battery_range_km,
+        "rng_rated": lap_data[-1].rated_battery_range_km,
+        "d_rng_rated": lap_data[0].rated_battery_range_km -  lap_data[-1].rated_battery_range_km,
+        "d_energy": config["consumption_rated"] / 100 * (lap_data[0].rated_battery_range_km -  lap_data[-1].rated_battery_range_km),
+        "energy_hour": (config["consumption_rated"] / 100 * (lap_data[0].rated_battery_range_km -  lap_data[-1].rated_battery_range_km)) / lap_time.total_seconds() * 3600.0,
+        "energy_left": config["consumption_rated"] / 100 * lap_data[-1].rated_battery_range_km,
+    }
 
 
 def get_segment_laps(config, segment, laps):
-    """Extract the segment laps."""
+    """Extract the segment laps.  """
     segment_laps = []
     for i, lap in enumerate(laps):
-        start, stop = lap
-        stop += 1
+        lap_id = lap["id"]
+        start = lap["from"]
+        stop = lap["to"] + 1
         lap_data = segment[start:stop]
-        lap_dist = 0
-        for j in range(len(lap_data) - 1):
-            a = lap_data[j]
-            b = lap_data[j + 1]
-            pta = (a.latitude, a. longitude)
-            ptb = (b.latitude, b. longitude)
-            lap_dist += vincenty(pta, ptb)
-        tz = pendulum.timezone('Europe/Paris')
-        sd = pendulum.instance(lap_data[0].date, 'utc')
-        ed = pendulum.instance(lap_data[-1].date, 'utc')
-        lap_time = lap_data[-1].date - lap_data[0].date
-        new_lap = {
-            "id": i + 1,
-            "start_time": sd.in_tz("Europe/Prague").format("DD.MM.YY HH:mm.ss"),
-            "end_time":  ed.in_tz("Europe/Prague").format("DD.MM.YY HH:mm.ss"),
-            "lap_time": str(lap_time),
-            "lap_dist": lap_dist / 1000.0,
-            "lap_speed": lap_dist / lap_time.total_seconds() * 3.6,
-            "odo_dist": lap_data[-1].odometer -  lap_data[0].odometer,
-            "d_soc": lap_data[0].battery_level -  lap_data[-1].battery_level,
-            "d_rng_ideal": lap_data[0].ideal_battery_range_km -  lap_data[-1].ideal_battery_range_km,
-            "d_rng_est": lap_data[0].est_battery_range_km -  lap_data[-1].est_battery_range_km,
-            "d_rng_rated": lap_data[0].rated_battery_range_km -  lap_data[-1].rated_battery_range_km,
-            "d_energy": config["consumption_rated"] / 100 * (lap_data[0].rated_battery_range_km -  lap_data[-1].rated_battery_range_km),
-        }
-
-
-        #dataset(, speed=93, power=-43.0,  )
-
-
-        #for key, val in segment.items():
-        #    if key in ('average-hr', 'ele-up', 'ele-down'):
-        #        pass
-        #    else:
-        #        new_lap[key] = val[start:stop]
-        #new_lap['average-hr'] = np.average(new_lap['pulse'])
-        #new_lap['distance'] = new_lap['distance'] - new_lap['distance'][0]
-        #for key in ('time-delta', 'delta-seconds'):
-        #    new_lap[key] = [i - new_lap[key][0] for i in new_lap[key]]
-        #ele_diff = np.diff(new_lap['ele'])
-        #new_lap['ele-up'] = ele_diff[np.where(ele_diff > 0)[0]].sum()
-        #new_lap['ele-down'] = ele_diff[np.where(ele_diff < 0)[0]].sum()
-        #print('\nData for lap: {}'.format(i+1))
-        #print('\tAverage HR: {:6.2f}'.format(new_lap['average-hr']))
-        #print('\tDistance (m): {:<9.2f}'.format(new_lap['distance'][-1]))
-        #print('\tTime (H:M:S): {}'.format(new_lap['time-delta'][-1]))
-        #print('\tElevation gain: {:<9.2f}'.format(new_lap['ele-up']))
-        #print('\tElevation drop: {:<9.2f}'.format(new_lap['ele-down']))
+        new_lap = extract_lap_info(config, lap_id, lap_data)
         segment_laps.append(new_lap)
     return segment_laps
 
